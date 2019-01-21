@@ -229,6 +229,7 @@ struct gwlan_loader {
 
 static struct kobj_attribute wlan_boot_attribute =
 	__ATTR(boot_wlan, 0220, NULL, wlan_boot_cb);
+static bool hdd_loaded = false;
 
 static struct attribute *attrs[] = {
 	&wlan_boot_attribute.attr,
@@ -14929,6 +14930,7 @@ void hdd_init_start_completion(void)
 	INIT_COMPLETION(wlan_start_comp);
 }
 
+static int hdd_driver_load(void);
 static ssize_t wlan_hdd_state_ctrl_param_write(struct file *filp,
 						const char __user *user_buf,
 						size_t count,
@@ -14960,7 +14962,15 @@ static ssize_t wlan_hdd_state_ctrl_param_write(struct file *filp,
 		goto exit;
 	}
 
-	if (!cds_is_driver_loaded() || cds_is_driver_recovering()) {
+	if (!hdd_loaded) {
+		if (hdd_driver_load()) {
+			pr_err("%s: Failed to init hdd module\n", __func__);
+			goto exit;
+		}
+	}
+
+	if (!cds_is_driver_loaded()) {
+		init_completion(&wlan_start_comp);
 		rc = wait_for_completion_timeout(&wlan_start_comp,
 				msecs_to_jiffies(HDD_WLAN_START_WAIT_TIME));
 		if (!rc) {
@@ -15379,16 +15389,10 @@ static QDF_STATUS hdd_qdf_init(void)
 	qdf_mc_timer_manager_init();
 	qdf_event_list_init();
 
-	status = qdf_talloc_feature_init();
-	if (QDF_IS_STATUS_ERROR(status)) {
-		hdd_err("Failed to init talloc; status:%u", status);
-		goto event_deinit;
-	}
-
-	status = qdf_cpuhp_init();
-	if (QDF_IS_STATUS_ERROR(status)) {
-		hdd_err("Failed to init cpuhp; status:%u", status);
-		goto talloc_deinit;
+	errno = pld_init();
+	if (errno) {
+		hdd_fln("Failed to init PLD; errno:%d", errno);
+		goto wakelock_destroy;
 	}
 
 	status = qdf_trace_spin_lock_init();
@@ -15397,8 +15401,8 @@ static QDF_STATUS hdd_qdf_init(void)
 		goto cpuhp_deinit;
 	}
 
-	qdf_trace_init();
-	qdf_register_debugcb_init();
+	hdd_loaded = true;
+	pr_info("%s: driver loaded\n", WLAN_MODULE_NAME);
 
 	return QDF_STATUS_SUCCESS;
 
@@ -15416,6 +15420,14 @@ event_deinit:
 	qdf_debugfs_exit();
 print_deinit:
 	hdd_qdf_print_deinit();
+pld_deinit:
+	pld_deinit();
+wakelock_destroy:
+	qdf_wake_lock_destroy(&wlan_wake_lock);
+comp_deinit:
+	hdd_component_deinit();
+hdd_deinit:
+	hdd_deinit();
 
 exit:
 	return status;
@@ -15423,7 +15435,15 @@ exit:
 
 static void hdd_qdf_deinit(void)
 {
-	/* currently, no debugcb deinit */
+
+	int ret;
+
+	ret = wlan_hdd_state_ctrl_param_create();
+	if (ret)
+		pr_err("wlan_hdd_state_create:%x\n", ret);
+
+	return ret;
+}
 
 	qdf_trace_deinit();
 

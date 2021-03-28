@@ -216,6 +216,8 @@ static unsigned int dev_num = 1;
 static struct cdev wlan_hdd_state_cdev;
 static struct class *class;
 static dev_t device;
+static bool hdd_loaded = false;
+
 #if 0
 static struct gwlan_loader *wlan_loader;
 static ssize_t wlan_boot_cb(struct kobject *kobj,
@@ -229,7 +231,6 @@ struct gwlan_loader {
 
 static struct kobj_attribute wlan_boot_attribute =
 	__ATTR(boot_wlan, 0220, NULL, wlan_boot_cb);
-static bool hdd_loaded = false;
 
 static struct attribute *attrs[] = {
 	&wlan_boot_attribute.attr,
@@ -12106,6 +12107,15 @@ static int hdd_update_mac_addr_to_fw(struct hdd_context *hdd_ctx)
 	return 0;
 }
 
+static void reverse_byte_array(uint8_t *arr, int len) {
+	int i;
+	for (i = 0; i < len / 2; i++) {
+		char temp = arr[i];
+		arr[i] = arr[len - i - 1];
+		arr[len - i - 1] = temp;
+	}
+}
+
 /**
  * hdd_initialize_mac_address() - API to get wlan mac addresses
  * @hdd_ctx: HDD Context
@@ -12141,6 +12151,7 @@ static int hdd_initialize_mac_address(struct hdd_context *hdd_ctx)
 
 	/* Use fw provided MAC */
 	if (!qdf_is_macaddr_zero(&hdd_ctx->hw_macaddr)) {
+		reverse_byte_array(&hdd_ctx->hw_macaddr.bytes[0], 6);
 		hdd_update_macaddr(hdd_ctx, hdd_ctx->hw_macaddr, false);
 		update_mac_addr_to_fw = false;
 		return 0;
@@ -14969,8 +14980,7 @@ static ssize_t wlan_hdd_state_ctrl_param_write(struct file *filp,
 		}
 	}
 
-	if (!cds_is_driver_loaded()) {
-		init_completion(&wlan_start_comp);
+	if (!cds_is_driver_loaded() || cds_is_driver_recovering()) {
 		rc = wait_for_completion_timeout(&wlan_start_comp,
 				msecs_to_jiffies(HDD_WLAN_START_WAIT_TIME));
 		if (!rc) {
@@ -15389,10 +15399,16 @@ static QDF_STATUS hdd_qdf_init(void)
 	qdf_mc_timer_manager_init();
 	qdf_event_list_init();
 
-	errno = pld_init();
-	if (errno) {
-		hdd_fln("Failed to init PLD; errno:%d", errno);
-		goto wakelock_destroy;
+	status = qdf_talloc_feature_init();
+	if (QDF_IS_STATUS_ERROR(status)) {
+		hdd_err("Failed to init talloc; status:%u", status);
+		goto event_deinit;
+	}
+
+	status = qdf_cpuhp_init();
+	if (QDF_IS_STATUS_ERROR(status)) {
+		hdd_err("Failed to init cpuhp; status:%u", status);
+		goto talloc_deinit;
 	}
 
 	status = qdf_trace_spin_lock_init();
@@ -15401,8 +15417,8 @@ static QDF_STATUS hdd_qdf_init(void)
 		goto cpuhp_deinit;
 	}
 
-	hdd_loaded = true;
-	pr_info("%s: driver loaded\n", WLAN_MODULE_NAME);
+	qdf_trace_init();
+	qdf_register_debugcb_init();
 
 	return QDF_STATUS_SUCCESS;
 
@@ -15420,14 +15436,6 @@ event_deinit:
 	qdf_debugfs_exit();
 print_deinit:
 	hdd_qdf_print_deinit();
-pld_deinit:
-	pld_deinit();
-wakelock_destroy:
-	qdf_wake_lock_destroy(&wlan_wake_lock);
-comp_deinit:
-	hdd_component_deinit();
-hdd_deinit:
-	hdd_deinit();
 
 exit:
 	return status;
@@ -15435,15 +15443,7 @@ exit:
 
 static void hdd_qdf_deinit(void)
 {
-
-	int ret;
-
-	ret = wlan_hdd_state_ctrl_param_create();
-	if (ret)
-		pr_err("wlan_hdd_state_create:%x\n", ret);
-
-	return ret;
-}
+	/* currently, no debugcb deinit */
 
 	qdf_trace_deinit();
 
@@ -15837,16 +15837,10 @@ static int hdd_driver_load(void)
 
 	hdd_set_conparam(con_mode);
 
-	errno = wlan_hdd_state_ctrl_param_create();
-	if (errno) {
-		hdd_err("Failed to create ctrl param; errno:%d", errno);
-		goto wakelock_destroy;
-	}
-
 	errno = pld_init();
 	if (errno) {
 		hdd_err("Failed to init PLD; errno:%d", errno);
-		goto param_destroy;
+		goto wakelock_destroy;
 	}
 
 	hdd_driver_mode_change_register();
@@ -15861,6 +15855,7 @@ static int hdd_driver_load(void)
 		goto pld_deinit;
 	}
 
+	hdd_loaded = true;
 	hdd_debug("%s: driver loaded", WLAN_MODULE_NAME);
 
 	return 0;
@@ -15879,8 +15874,6 @@ pld_deinit:
 	/* Wait for any ref taken on /dev/wlan to be released */
 	while (qdf_atomic_read(&wlan_hdd_state_fops_ref))
 		;
-param_destroy:
-	wlan_hdd_state_ctrl_param_destroy();
 wakelock_destroy:
 	qdf_wake_lock_destroy(&wlan_wake_lock);
 comp_deinit:
@@ -16121,10 +16114,13 @@ static int wlan_deinit_sysfs(void)
  */
 static int hdd_module_init(void)
 {
-	if (hdd_driver_load())
-		return -EINVAL;
+	int ret;
 
-	return 0;
+	ret = wlan_hdd_state_ctrl_param_create();
+	if (ret)
+		pr_err("wlan_hdd_state_create:%x\n", ret);
+
+	return ret;
 }
 
 /**
